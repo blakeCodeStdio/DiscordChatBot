@@ -114,6 +114,12 @@ client.on('messageCreate', async (message) => {
         conversationHistory.unshift(systemMessage);
         conversationHistory.push({ role: 'user', content: userMessage });
 
+        // **限制對話歷史訊息的數量**
+        const MAX_HISTORY_LENGTH = 5;
+        if(conversationHistory > MAX_HISTORY_LENGTH){
+            conversationHistory = conversationHistory.slice(0, MAX_HISTORY_LENGTH);
+        }
+
         // 發送請求到 Groq API
         const response = await axios.post(
             'https://api.groq.com/openai/v1/chat/completions',
