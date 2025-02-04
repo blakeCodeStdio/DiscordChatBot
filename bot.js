@@ -1,27 +1,28 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits } = require('discord.js');
 const axios = require('axios');
-
 const express = require('express');
+
+// Express 伺服器設定
 const app = express();
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`伺服器正在監聽端口 ${PORT}`));
 
-// 設置一個簡單的 HTTP 端口監聽
-app.listen(process.env.PORT || 3000, () => {
-    console.log('伺服器正在監聽端口 3000...');
-});
-
+// 初始化 Discord 客戶端
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent, // 確保可以讀取訊息內容
+        GatewayIntentBits.MessageContent,
     ],
 });
 
-const WEATHER_API_KEY = process.env.WEATHER_API_KEY; // OpenWeather API Key
-const GROQ_API_KEY = process.env.GROQ_API_KEY; // Groq API Key
-
-let conversationHistory = [];
+// 環境變數和常數
+const WEATHER_API_KEY = process.env.WEATHER_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const MAX_HISTORY_LENGTH = 10;
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000;
 
 // **城市名稱對應表**
 const cityMapping = {
@@ -47,124 +48,176 @@ const cityMapping = {
     "連江": "Lienchiang",
 };
 
+// 對話管理類別
+class ConversationManager {
+    constructor() {
+        this.conversations = new Map();
+    }
 
-// 設定系統訊息，確保使用繁體中文
-const systemMessage = {
-    role: 'system',
-    content: '你是個專精於繁體中文的聊天助手。請以繁體中文回應所有訊息，並避免混用其他語言或字符。',
-};
+    getHistory(userId) {
+        if (!this.conversations.has(userId)) {
+            this.conversations.set(userId, [{
+                role: 'system',
+                content: '你是個專精於繁體中文的聊天助手。請以繁體中文回應所有訊息，並避免混用其他語言或字符。'
+            }]);
+        }
+        return this.conversations.get(userId);
+    }
 
+    addMessage(userId, message) {
+        const history = this.getHistory(userId);
+        history.push(message);
+        
+        // 保持歷史記錄在限制範圍內
+        if (history.length > MAX_HISTORY_LENGTH) {
+            history.splice(1, history.length - MAX_HISTORY_LENGTH);
+        }
+    }
+}
+
+// 天氣服務類別
+class WeatherService {
+    static async getCurrentWeather(city) {
+        const encodedCity = encodeURIComponent(cityMapping[city] || city);
+        const url = `https://api.openweathermap.org/data/2.5/weather?q=${encodedCity}&appid=${WEATHER_API_KEY}&units=metric&lang=zh_tw`;
+        const response = await axios.get(url);
+        return response.data;
+    }
+
+    static async getForecast(city) {
+        const encodedCity = encodeURIComponent(cityMapping[city] || city);
+        const url = `https://api.openweathermap.org/data/2.5/forecast?q=${encodedCity}&appid=${WEATHER_API_KEY}&units=metric&lang=zh_tw`;
+        const response = await axios.get(url);
+        return response.data;
+    }
+
+    static formatWeatherResponse(current, forecast) {
+        const dailyForecasts = this.processForecast(forecast.list);
+        const forecastMsg = this.formatForecastMessage(dailyForecasts);
+
+        return `
+📍 **${current.name}** 的天氣：
+🌡 當前溫度: ${current.main.temp}°C
+🌬 風速: ${current.wind.speed}m/s
+☁ 天氣: ${current.weather[0].description}
+🔮 **未來 3 天天氣預報：**
+${forecastMsg}`;
+    }
+
+    static processForecast(forecastList) {
+        const dailyForecasts = {};
+        forecastList.forEach(item => {
+            const date = item.dt_txt.split(' ')[0];
+            if (!dailyForecasts[date]) {
+                dailyForecasts[date] = item;
+            }
+        });
+        return dailyForecasts;
+    }
+
+    static formatForecastMessage(dailyForecasts) {
+        return Object.entries(dailyForecasts)
+            .slice(0, 3)
+            .map(([date, forecast]) => 
+                `📅 **${date}**：${forecast.weather[0].description}，` +
+                `🌡 溫度 ${forecast.main.temp}°C，` +
+                `🌬 風速 ${forecast.wind.speed}m/s`)
+            .join('\n');
+    }
+}
+
+// 聊天服務類別
+class ChatService {
+    static async getResponse(messages) {
+        let attempts = 0;
+        while (attempts < MAX_RETRIES) {
+            try {
+                const response = await axios.post(
+                    'https://api.groq.com/openai/v1/chat/completions',
+                    {
+                        model: 'llama3-70b-8192',
+                        messages,
+                    },
+                    {
+                        headers: {
+                            'Authorization': `Bearer ${GROQ_API_KEY}`,
+                            'Content-Type': 'application/json',
+                        },
+                    }
+                );
+                
+                const reply = response.data.choices?.[0]?.message?.content;
+                if (!reply?.trim()) {
+                    throw new Error('收到空回應');
+                }
+                return reply;
+            } catch (error) {
+                attempts++;
+                if (attempts === MAX_RETRIES) throw error;
+                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+            }
+        }
+    }
+}
+
+// 初始化對話管理器
+const conversationManager = new ConversationManager();
+
+// 訊息處理器
 client.on('messageCreate', async (message) => {
-    if (message.author.bot) return; // 忽略機器人訊息
+    if (message.author.bot) return;
 
     try {
-        const userMessage = message.content.trim(); // 去掉多餘的空白
-        console.log('收到訊息:', userMessage); // 顯示收到的訊息，方便調試
-
+        const userMessage = message.content.trim();
+        
         if (!userMessage) {
-            message.reply('請輸入訊息，我在這裡等你聊天！');
+            await message.reply('請輸入訊息，我在這裡等你聊天！');
             return;
         }
 
-        // **檢查是否為天氣查詢**
+        // 處理天氣查詢
         if (userMessage.startsWith('!天氣')) {
-            let city = userMessage.split(' ')[1]; // 取得城市名稱
-            if (!city) return message.reply('請輸入城市名稱，例如 !天氣 台北');
-
-            // **將輸入的城市名稱轉換為 API 可識別的名稱**
-            city = cityMapping[city] || city;
+            const city = userMessage.split(' ')[1];
+            if (!city) {
+                await message.reply('請輸入城市名稱，例如 !天氣 台北');
+                return;
+            }
 
             try {
-                // 查詢當前天氣
-                const currentWeatherUrl = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${WEATHER_API_KEY}&units=metric&lang=zh_tw`;
-                const currentWeatherRes = await axios.get(currentWeatherUrl);
-                const currentWeather = currentWeatherRes.data;
-
-                // 查詢未來 3 天的天氣預報
-                const forecastUrl = `https://api.openweathermap.org/data/2.5/forecast?q=${encodeURIComponent(city)}&appid=${WEATHER_API_KEY}&units=metric&lang=zh_tw`;
-                const forecastRes = await axios.get(forecastUrl);
-                const forecastList = forecastRes.data.list;
-
-                // 整理未來 3 天的天氣預測
-                let forecastMsg = "";
-                const dailyForecasts = {};
-
-                forecastList.forEach((item) => {
-                    const date = item.dt_txt.split(' ')[0]; // 取得日期
-                    if (!dailyForecasts[date]) {
-                        dailyForecasts[date] = item; // 每天只取第一個資料點
-                    }
-                });
-
-                Object.keys(dailyForecasts).slice(0, 3).forEach((date) => {
-                    const forecast = dailyForecasts[date];
-                    forecastMsg += `📅 **${date}**：${forecast.weather[0].description}，🌡 溫度 ${forecast.main.temp}°C，🌬 風速 ${forecast.wind.speed}m/s\n`;
-                });
-
-                // 組合回應訊息
-                const reply = `
-                    
-            📍 **${currentWeather.name}** 的天氣：
-            🌡 當前溫度: ${currentWeather.main.temp}°C
-            🌬 風速: ${currentWeather.wind.speed}m/s
-            ☁ 天氣: ${currentWeather.weather[0].description}
-            🔮 **未來 3 天天氣預報：**
-            ${forecastMsg}`;
-
-                if (!reply || reply.trim() === '') {
-                    return message.reply('⚠️ 抱歉，無法取得天氣資訊，請稍後再試！');
-                }
-                return message.reply(reply);
+                const [current, forecast] = await Promise.all([
+                    WeatherService.getCurrentWeather(city),
+                    WeatherService.getForecast(city)
+                ]);
+                const response = WeatherService.formatWeatherResponse(current, forecast);
+                await message.reply(response);
             } catch (error) {
-                console.error('查詢天氣時發生錯誤：', error);
-                return message.reply('查詢天氣失敗，請確認城市名稱是否正確！');
+                console.error('天氣 API 錯誤:', error);
+                await message.reply('查詢天氣失敗，請確認城市名稱是否正確！');
             }
+            return;
         }
 
-        // **處理一般聊天對話**
-        conversationHistory.unshift(systemMessage);
-        conversationHistory.push({ role: 'user', content: userMessage });
+        // 處理聊天訊息
+        const conversationHistory = conversationManager.getHistory(message.author.id);
+        conversationManager.addMessage(message.author.id, { role: 'user', content: userMessage });
 
-        // **限制對話歷史訊息的數量**
-        const MAX_HISTORY_LENGTH = 10;
-        if (conversationHistory.length > MAX_HISTORY_LENGTH) {
-            conversationHistory = conversationHistory.slice(0, MAX_HISTORY_LENGTH);
-        }
+        const botReply = await ChatService.getResponse(conversationHistory);
+        await message.reply(botReply);
 
-        // 發送請求到 Groq API
-        const response = await axios.post(
-            'https://api.groq.com/openai/v1/chat/completions',
-            {
-                model: 'llama3-70b-8192',
-                messages: conversationHistory, // 包含歷史對話
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${GROQ_API_KEY}`,
-                    'Content-Type': 'application/json',
-                },
-            }
-        );
-
-        const botReply = response.data.choices && response.data.choices[0] ? response.data.choices[0].message.content : '';
-
-        // 確保 botReply 不是空的
-        if (!botReply || botReply.trim() === '') {
-            return message.reply('⚠️ 抱歉，我暫時無法回答這個問題。');
-        }
-        // 發送回覆
-        message.reply(botReply);
-
-        // 更新對話歷史
-        conversationHistory.push({ role: 'assistant', content: botReply });
+        conversationManager.addMessage(message.author.id, { role: 'assistant', content: botReply });
 
     } catch (error) {
-        console.error('Groq API 發生錯誤：', error.response ? error.response.data : error);
-        message.reply('發生錯誤，請稍後再試！');
+        console.error('訊息處理錯誤:', error);
+        await message.reply('很抱歉，處理訊息時發生錯誤。請稍後再試！');
     }
 });
 
-// 登入 Discord bot
+// Discord 客戶端錯誤處理
+client.on('error', error => {
+    console.error('Discord 客戶端錯誤:', error);
+});
+
+// 啟動 Discord 機器人
 client.login(process.env.DISCORD_TOKEN)
-    .then(() => console.log('✅ Bot has logged in successfully!'))
-    .catch((error) => console.error('❌ Login failed:', error));
+    .then(() => console.log('✅ 機器人已成功登入'))
+    .catch(error => console.error('❌ 登入失敗:', error));
