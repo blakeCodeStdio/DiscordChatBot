@@ -26,24 +26,24 @@ let conversationHistory = [];
 // **城市名稱對應表**
 const cityMapping = {
     "基隆": "Keelung",        // 北部
-    "台北": "Taipei", 
-    "新北": "New Taipei", 
-    "桃園": "Taoyuan", 
-    "新竹": "Hsinchu", 
-    "宜蘭": "Yilan",         
+    "台北": "Taipei",
+    "新北": "New Taipei",
+    "桃園": "Taoyuan",
+    "新竹": "Hsinchu",
+    "宜蘭": "Yilan",
     "台中": "Taichung",      // 中部
-    "苗栗": "Miaoli", 
-    "彰化": "Changhua", 
-    "南投": "Nantou", 
-    "雲林": "Yunlin", 
+    "苗栗": "Miaoli",
+    "彰化": "Changhua",
+    "南投": "Nantou",
+    "雲林": "Yunlin",
     "嘉義": "Chiayi",        // 南部
-    "台南": "Tainan", 
-    "高雄": "Kaohsiung", 
-    "屏東": "Pingtung", 
+    "台南": "Tainan",
+    "高雄": "Kaohsiung",
+    "屏東": "Pingtung",
     "台東": "Taitung",       // 東部
-    "花蓮": "Hualien", 
+    "花蓮": "Hualien",
     "澎湖": "Penghu",        // 離島
-    "金門": "Kinmen", 
+    "金門": "Kinmen",
     "連江": "Lienchiang",
 };
 
@@ -102,7 +102,7 @@ client.on('messageCreate', async (message) => {
                 });
 
                 // 組合回應訊息
-                const reply =`
+                const reply = `
                     
             📍 **${currentWeather.name}** 的天氣：
             🌡 當前溫度: ${currentWeather.main.temp}°C
@@ -111,6 +111,9 @@ client.on('messageCreate', async (message) => {
             🔮 **未來 3 天天氣預報：**
             ${forecastMsg}`;
 
+                if (!reply || reply.trim() === '') {
+                    return message.reply('⚠️ 抱歉，無法取得天氣資訊，請稍後再試！');
+                }
                 return message.reply(reply);
             } catch (error) {
                 console.error('查詢天氣時發生錯誤：', error);
@@ -124,7 +127,7 @@ client.on('messageCreate', async (message) => {
 
         // **限制對話歷史訊息的數量**
         const MAX_HISTORY_LENGTH = 10;
-        if(conversationHistory.length > MAX_HISTORY_LENGTH){
+        if (conversationHistory.length > MAX_HISTORY_LENGTH) {
             conversationHistory = conversationHistory.slice(0, MAX_HISTORY_LENGTH);
         }
 
@@ -143,8 +146,12 @@ client.on('messageCreate', async (message) => {
             }
         );
 
-        const botReply = response.data.choices[0].message.content;
+        const botReply = response.data.choices && response.data.choices[0] ? response.data.choices[0].message.content : '';
 
+        // 確保 botReply 不是空的
+        if (!botReply || botReply.trim() === '') {
+            return message.reply('⚠️ 抱歉，我暫時無法回答這個問題。');
+        }
         // 發送回覆
         message.reply(botReply);
 
