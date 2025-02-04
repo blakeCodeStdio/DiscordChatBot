@@ -2,6 +2,14 @@ require('dotenv').config();
 const { Client, GatewayIntentBits } = require('discord.js');
 const axios = require('axios');
 
+const express = require('express');
+const app = express();
+
+// 設置一個簡單的 HTTP 端口監聽
+app.listen(process.env.PORT || 3000, () => {
+    console.log('伺服器正在監聽端口 3000...');
+});
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -115,8 +123,8 @@ client.on('messageCreate', async (message) => {
         conversationHistory.push({ role: 'user', content: userMessage });
 
         // **限制對話歷史訊息的數量**
-        const MAX_HISTORY_LENGTH = 5;
-        if(conversationHistory > MAX_HISTORY_LENGTH){
+        const MAX_HISTORY_LENGTH = 10;
+        if(conversationHistory.length > MAX_HISTORY_LENGTH){
             conversationHistory = conversationHistory.slice(0, MAX_HISTORY_LENGTH);
         }
 
