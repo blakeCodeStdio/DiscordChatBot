@@ -24,6 +24,21 @@ const MAX_HISTORY_LENGTH = 10;
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000;
 
+// 添加連線維護相關常數
+const HEARTBEAT_INTERVAL = 4 * 60 * 1000; // 4分鐘檢查一次
+const RECONNECT_DELAY = 30000; // 30秒重試間隔
+let heartbeatInterval;
+
+// 添加連線狀態管理
+let isConnected = false;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+
+// 重設重連次數的計時器
+setInterval(() => {
+    reconnectAttempts = 0;
+}, 3600000); // 每小時重設
+
 // **城市名稱對應表**
 const cityMapping = {
     "基隆": "Keelung",        // 北部
@@ -48,10 +63,14 @@ const cityMapping = {
     "連江": "Lienchiang",
 };
 
-// 對話管理類別
+// 擴展 ConversationManager 類別，添加清理機制
 class ConversationManager {
     constructor() {
         this.conversations = new Map();
+        this.lastAccess = new Map();
+        
+        // 每6小時清理一次過期對話
+        setInterval(() => this.cleanupOldConversations(), 6 * 60 * 60 * 1000);
     }
 
     getHistory(userId) {
@@ -61,6 +80,7 @@ class ConversationManager {
                 content: '你是個專精於繁體中文的聊天助手。請以繁體中文回應所有訊息，並避免混用其他語言或字符。'
             }]);
         }
+        this.lastAccess.set(userId, Date.now());
         return this.conversations.get(userId);
     }
 
@@ -68,9 +88,22 @@ class ConversationManager {
         const history = this.getHistory(userId);
         history.push(message);
         
-        // 保持歷史記錄在限制範圍內
         if (history.length > MAX_HISTORY_LENGTH) {
             history.splice(1, history.length - MAX_HISTORY_LENGTH);
+        }
+        this.lastAccess.set(userId, Date.now());
+    }
+
+    // 清理24小時未使用的對話
+    cleanupOldConversations() {
+        const now = Date.now();
+        const expiryTime = 24 * 60 * 60 * 1000; // 24小時
+        
+        for (const [userId, lastAccess] of this.lastAccess.entries()) {
+            if (now - lastAccess > expiryTime) {
+                this.conversations.delete(userId);
+                this.lastAccess.delete(userId);
+            }
         }
     }
 }
@@ -126,11 +159,13 @@ ${forecastMsg}`;
     }
 }
 
-// 聊天服務類別
+// 優化 ChatService 類別
 class ChatService {
     static async getResponse(messages) {
         let attempts = 0;
-        while (attempts < MAX_RETRIES) {
+        const maxRetries = MAX_RETRIES;
+        
+        while (attempts < maxRetries) {
             try {
                 const response = await axios.post(
                     'https://api.groq.com/openai/v1/chat/completions',
@@ -143,6 +178,7 @@ class ChatService {
                             'Authorization': `Bearer ${GROQ_API_KEY}`,
                             'Content-Type': 'application/json',
                         },
+                        timeout: 30000, // 設置30秒超時
                     }
                 );
                 
@@ -153,10 +189,56 @@ class ChatService {
                 return reply;
             } catch (error) {
                 attempts++;
-                if (attempts === MAX_RETRIES) throw error;
-                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+                console.error(`API 嘗試 ${attempts}/${maxRetries} 失敗:`, error.message);
+                
+                if (attempts === maxRetries) throw error;
+                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * attempts));
             }
         }
+    }
+}
+
+// 心跳檢查函數
+function startHeartbeat() {
+    if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+    }
+    
+    heartbeatInterval = setInterval(() => {
+        if (!client.ws.ping || !isConnected) {
+            console.log('檢測到連線異常，準備重新連線...');
+            reconnect();
+        } else {
+            console.log(`連線正常，延遲: ${client.ws.ping}ms`);
+        }
+    }, HEARTBEAT_INTERVAL);
+}
+
+// 重新連線函數
+async function reconnect() {
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.error('已達到最大重試次數，請檢查網路連線或手動重啟機器人');
+        process.exit(1);
+    }
+
+    try {
+        if (heartbeatInterval) {
+            clearInterval(heartbeatInterval);
+        }
+        
+        console.log(`進行第 ${reconnectAttempts + 1} 次重新連線...`);
+        await client.destroy();
+        await client.login(process.env.DISCORD_TOKEN);
+        
+        isConnected = true;
+        reconnectAttempts = 0;
+        startHeartbeat();
+        
+        console.log('重新連線成功！');
+    } catch (error) {
+        console.error('重新連線失敗:', error);
+        reconnectAttempts++;
+        setTimeout(reconnect, RECONNECT_DELAY);
     }
 }
 
@@ -212,12 +294,56 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-// Discord 客戶端錯誤處理
+// Discord 事件處理
+client.on('ready', () => {
+    console.log(`✅ 機器人 ${client.user.tag} 已成功登入！`);
+    isConnected = true;
+    startHeartbeat();
+});
+
+client.on('disconnect', () => {
+    console.log('機器人已斷線');
+    isConnected = false;
+    reconnect();
+});
+
+client.on('reconnecting', () => {
+    console.log('正在重新連線中...');
+    isConnected = false;
+});
+
+client.on('resume', () => {
+    console.log('連線已恢復！');
+    isConnected = true;
+});
+
+// 優化錯誤處理
 client.on('error', error => {
     console.error('Discord 客戶端錯誤:', error);
+    isConnected = false;
+    reconnect();
+});
+
+// 處理未捕獲的錯誤
+process.on('unhandledRejection', (error) => {
+    console.error('未處理的 Promise 拒絕:', error);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('未捕獲的異常:', error);
+    if (!isConnected) {
+        reconnect();
+    }
 });
 
 // 啟動 Discord 機器人
 client.login(process.env.DISCORD_TOKEN)
-    .then(() => console.log('✅ 機器人已成功登入'))
-    .catch(error => console.error('❌ 登入失敗:', error));
+    .then(() => {
+        console.log('✅ 機器人初始登入成功');
+        isConnected = true;
+        startHeartbeat();
+    })
+    .catch(error => {
+        console.error('❌ 登入失敗:', error);
+        reconnect();
+    });
